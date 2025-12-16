@@ -58,10 +58,6 @@ async function sendToChannel(text) {
 
 /* ---------------- HELPERS ---------------- */
 
-function isKyivRegion(text) {
-  return /київщин/i.test(text);
-}
-
 function extractDate(text) {
   const m = text.match(/на\s+(\d{1,2})\s+([а-яіїє]+)/i);
   if (!m) return "";
@@ -90,6 +86,7 @@ function parseQueues(text) {
       result[current].push(`❌ з ${t[1]} до ${t[2]}`);
     }
   }
+
   return result;
 }
 
@@ -109,31 +106,30 @@ function buildMessage(date, queues) {
 async function checkDTEK() {
   const lastId = await redisGet(LAST_KEY);
 
-  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 20 });
+  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 30 });
 
-  const photoMsg = messages.find(
-    m => m.media?.photo && m.groupedId
+  const captionMsg = messages.find(
+    m =>
+      m.message &&
+      /київщина[:.]?\s*графіки відключень/i.test(m.message)
   );
-  if (!photoMsg) return;
 
-  const albumId = photoMsg.groupedId;
-  const album = messages.filter(m => m.groupedId === albumId);
-
-  const captionMsg = album.find(m => m.message);
   if (!captionMsg) return;
-
-  if (!isKyivRegion(captionMsg.message)) return;
   if (String(captionMsg.id) === lastId) return;
 
   let allText = captionMsg.message + "\n";
 
-  for (let i = 0; i < album.length; i++) {
-    if (!album[i].media?.photo) continue;
+  if (captionMsg.groupedId) {
+    const album = messages.filter(
+      m => m.groupedId === captionMsg.groupedId && m.media?.photo
+    );
 
-    const path = `img_${i}.jpg`;
-    await client.downloadMedia(album[i].media.photo, { file: path });
-    allText += await ocrImage(path) + "\n";
-    fs.unlinkSync(path);
+    for (let i = 0; i < album.length; i++) {
+      const path = `img_${i}.jpg`;
+      await client.downloadMedia(album[i].media.photo, { file: path });
+      allText += await ocrImage(path) + "\n";
+      fs.unlinkSync(path);
+    }
   }
 
   const queues = parseQueues(allText);
