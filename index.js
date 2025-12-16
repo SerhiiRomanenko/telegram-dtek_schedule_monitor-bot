@@ -25,6 +25,8 @@ const client = new TelegramClient(
   { connectionRetries: 5 }
 );
 
+/* ---------------- REDIS ---------------- */
+
 async function redisGet(key) {
   const r = await fetch(`${UPSTASH_REDIS_REST_URL}/get/${key}`, {
     headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` }
@@ -39,6 +41,8 @@ async function redisSet(key, value) {
   });
 }
 
+/* ---------------- TELEGRAM SEND ---------------- */
+
 async function sendToChannel(text) {
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -50,6 +54,12 @@ async function sendToChannel(text) {
       disable_web_page_preview: true
     })
   });
+}
+
+/* ---------------- HELPERS ---------------- */
+
+function isKyivRegion(text) {
+  return /київщин/i.test(text);
 }
 
 function extractDate(text) {
@@ -74,56 +84,69 @@ function parseQueues(text) {
       current = q[1];
       result[current] = [];
     }
+
     const t = l.match(/(\d{1,2}:\d{2}).+?(\d{1,2}:\d{2})/);
     if (current && t) {
-      result[current].push(`❌з ${t[1]} до ${t[2]}`);
+      result[current].push(`❌ з ${t[1]} до ${t[2]}`);
     }
   }
   return result;
 }
 
 function buildMessage(date, queues) {
-  let msg = `⚡️💡<b>Оновлений графік відключення світла</b>\n${date}\n\n`;
+  let msg = `⚡️💡 <b>Київщина — графік відключень ДТЕК</b>\n${date}\n\n`;
+
   for (const q of Object.keys(queues)) {
-    msg += `💡<b>Черга ${q} відключення:</b>\n`;
+    msg += `💡 <b>Черга ${q}:</b>\n`;
     msg += queues[q].join("\n") + "\n\n";
   }
+
   return msg;
 }
+
+/* ---------------- MAIN LOGIC ---------------- */
 
 async function checkDTEK() {
   const lastId = await redisGet(LAST_KEY);
 
-  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 5 });
-  const msg = messages.find(m =>
-    m.message &&
-    m.message.includes("Київщина: графіки відключень")
+  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 20 });
+
+  const photoMsg = messages.find(
+    m => m.media?.photo && m.groupedId
   );
-  if (!msg || String(msg.id) === lastId) return;
+  if (!photoMsg) return;
 
-  const photos = msg.media?.photo ? [msg.media.photo] : [];
-  if (!photos.length) return;
+  const albumId = photoMsg.groupedId;
+  const album = messages.filter(m => m.groupedId === albumId);
 
-  const files = [];
-  for (let i = 0; i < photos.length; i++) {
+  const captionMsg = album.find(m => m.message);
+  if (!captionMsg) return;
+
+  if (!isKyivRegion(captionMsg.message)) return;
+  if (String(captionMsg.id) === lastId) return;
+
+  let allText = captionMsg.message + "\n";
+
+  for (let i = 0; i < album.length; i++) {
+    if (!album[i].media?.photo) continue;
+
     const path = `img_${i}.jpg`;
-    await client.downloadMedia(photos[i], { file: path });
-    files.push(path);
-  }
-
-  let allText = "";
-  for (const f of files) {
-    allText += await ocrImage(f) + "\n";
-    fs.unlinkSync(f);
+    await client.downloadMedia(album[i].media.photo, { file: path });
+    allText += await ocrImage(path) + "\n";
+    fs.unlinkSync(path);
   }
 
   const queues = parseQueues(allText);
-  const date = extractDate(msg.message);
+  if (!Object.keys(queues).length) return;
+
+  const date = extractDate(allText);
   const out = buildMessage(date, queues);
 
   await sendToChannel(out);
-  await redisSet(LAST_KEY, String(msg.id));
+  await redisSet(LAST_KEY, String(captionMsg.id));
 }
+
+/* ---------------- START ---------------- */
 
 (async () => {
   await client.start();
