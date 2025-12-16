@@ -106,16 +106,26 @@ function buildMessage(date, queues) {
 async function checkDTEK() {
   const lastId = await redisGet(LAST_KEY);
 
-  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 30 });
+  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 40 });
+  console.log("Fetched messages:", messages.length);
 
   const captionMsg = messages.find(
     m =>
       m.message &&
-      /київщина[:.]?\s*графіки відключень/i.test(m.message)
+      /(^|\n).*київщина[:.]?\s*графіки відключень/i.test(m.message)
   );
 
-  if (!captionMsg) return;
-  if (String(captionMsg.id) === lastId) return;
+  if (!captionMsg) {
+    console.log("No Kyiv region schedule found");
+    return;
+  }
+
+  if (String(captionMsg.id) === lastId) {
+    console.log("Already processed:", captionMsg.id);
+    return;
+  }
+
+  console.log("Found target post:", captionMsg.id);
 
   let allText = captionMsg.message + "\n";
 
@@ -123,6 +133,8 @@ async function checkDTEK() {
     const album = messages.filter(
       m => m.groupedId === captionMsg.groupedId && m.media?.photo
     );
+
+    console.log("Album photos:", album.length);
 
     for (let i = 0; i < album.length; i++) {
       const path = `img_${i}.jpg`;
@@ -133,20 +145,32 @@ async function checkDTEK() {
   }
 
   const queues = parseQueues(allText);
-  if (!Object.keys(queues).length) return;
+  if (!Object.keys(queues).length) {
+    console.log("No queues detected");
+    return;
+  }
 
   const date = extractDate(allText);
   const out = buildMessage(date, queues);
 
   await sendToChannel(out);
   await redisSet(LAST_KEY, String(captionMsg.id));
+
+  console.log("Message sent");
 }
 
 /* ---------------- START ---------------- */
 
 (async () => {
   await client.start();
-  setInterval(checkDTEK, 30000);
+  console.log("Telegram client started");
+
+  await checkDTEK(); // 🔴 критично важливо
+
+  setInterval(() => {
+    console.log("Checking DTEK...");
+    checkDTEK();
+  }, 30000);
 })();
 
 const app = express();
