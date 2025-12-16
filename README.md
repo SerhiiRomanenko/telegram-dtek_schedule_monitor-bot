@@ -18,7 +18,7 @@
 ### 1. Клонування репозиторію
 
 ```bash
-git clone [https://github.com/ВАШ_КОРИСТУВАЧ/dtek-schedule-monitor.git](https://github.com/ВАШ_КОРИСТУВАЧ/dtek-schedule-monitor.git)
+git clone [https://github.com/SerhiiRomanenko/dtek-schedule-monitor.git](https://github.com/SerhiiRomanenko/dtek-schedule-monitor.git)
 cd dtek-schedule-monitor
 ```
 
