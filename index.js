@@ -3,7 +3,8 @@ import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import Tesseract from "tesseract.js";
 import express from "express";
-import fs from "fs";
+
+/* ================= ENV ================= */
 
 const {
   API_ID,
@@ -16,7 +17,11 @@ const {
 } = process.env;
 
 const DTEK_CHANNEL = "dtek_ua";
-const LAST_KEY = "last_dtek_msg";
+
+const REDIS_LAST_ALBUM = "last_dtek_album";
+const REDIS_LAST_MESSAGE = "last_dtek_message";
+
+/* ================= TELEGRAM CLIENT ================= */
 
 const client = new TelegramClient(
   new StringSession(TG_SESSION),
@@ -25,7 +30,7 @@ const client = new TelegramClient(
   { connectionRetries: 5 }
 );
 
-/* ---------------- REDIS ---------------- */
+/* ================= REDIS ================= */
 
 async function redisGet(key) {
   const r = await fetch(`${UPSTASH_REDIS_REST_URL}/get/${key}`, {
@@ -41,10 +46,10 @@ async function redisSet(key, value) {
   });
 }
 
-/* ---------------- TELEGRAM SEND ---------------- */
+/* ================= TELEGRAM BOT API ================= */
 
-async function sendToChannel(text) {
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+async function sendMessage(text) {
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -54,19 +59,44 @@ async function sendToChannel(text) {
       disable_web_page_preview: true
     })
   });
+
+  const j = await r.json();
+
+  if (!j.ok) {
+    console.error("[TG ERROR]", j);
+    throw new Error("sendMessage failed");
+  }
+
+  return j.result.message_id;
 }
 
-/* ---------------- HELPERS ---------------- */
+
+async function editMessage(messageId, text) {
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: CHAT_ID,
+      message_id: messageId,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    })
+  });
+}
+
+/* ================= OCR ================= */
+
+async function ocrBuffer(buffer) {
+  const { data } = await Tesseract.recognize(buffer, "ukr");
+  return data.text;
+}
+
+/* ================= PARSING ================= */
 
 function extractDate(text) {
   const m = text.match(/на\s+(\d{1,2})\s+([а-яіїє]+)/i);
-  if (!m) return "";
-  return `📆 ${m[1]} ${m[2]}`;
-}
-
-async function ocrImage(path) {
-  const { data } = await Tesseract.recognize(path, "ukr");
-  return data.text;
+  return m ? `📆 ${m[1]} ${m[2]}` : "";
 }
 
 function parseQueues(text) {
@@ -86,91 +116,104 @@ function parseQueues(text) {
       result[current].push(`❌ з ${t[1]} до ${t[2]}`);
     }
   }
-
   return result;
 }
 
-function buildMessage(date, queues) {
-  let msg = `⚡️💡 <b>Київщина — графік відключень ДТЕК</b>\n${date}\n\n`;
+function buildMessage(date, queues, updated) {
+  let msg = `⚡️💡 <b>${updated ? "ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ" : "ГРАФІК ВІДКЛЮЧЕНЬ СВІТЛА"}</b>\n`;
+  if (date) msg += `${date}\n\n`;
 
   for (const q of Object.keys(queues)) {
     msg += `💡 <b>Черга ${q}:</b>\n`;
     msg += queues[q].join("\n") + "\n\n";
   }
-
-  return msg;
+  return msg.trim();
 }
 
-/* ---------------- MAIN LOGIC ---------------- */
+/* ================= MAIN LOGIC ================= */
 
 async function checkDTEK() {
-  const lastId = await redisGet(LAST_KEY);
+  console.log("[CHECK] checking DTEK channel");
 
-  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 40 });
-  console.log("Fetched messages:", messages.length);
+  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 20 });
 
-  const captionMsg = messages.find(
-    m =>
-      m.message &&
-      /(^|\n).*київщина[:.]?\s*графіки відключень/i.test(m.message)
+  messages.forEach(m => {
+    console.log(
+      "[MSG]",
+      m.id,
+      "photo:",
+      !!m.media?.photo,
+      "text:",
+      m.message?.slice(0, 45)
+    );
+  });
+
+  const mainPost = messages.find(m =>
+    /Київщина:.*графіки/i.test(m.message || "") &&
+    !/оновлен/i.test(m.message || "")
   );
 
-  if (!captionMsg) {
-    console.log("No Kyiv region schedule found");
+  const updatedPost = messages.find(m =>
+    /Київщина:.*оновлен.*графіки/i.test(m.message || "")
+  );
+
+  const target = updatedPost || mainPost;
+
+  if (!target) {
+    console.log("[SKIP] no valid DTEK post");
     return;
   }
 
-  if (String(captionMsg.id) === lastId) {
-    console.log("Already processed:", captionMsg.id);
+  let photos = [];
+
+  if (target.media?.photo) {
+    photos = [target];
+  }
+
+  if (!photos.length) {
+    console.log("[SKIP] no photos to OCR");
     return;
   }
 
-  console.log("Found target post:", captionMsg.id);
+  let ocrText = "";
 
-  let allText = captionMsg.message + "\n";
-
-  if (captionMsg.groupedId) {
-    const album = messages.filter(
-      m => m.groupedId === captionMsg.groupedId && m.media?.photo
-    );
-
-    console.log("Album photos:", album.length);
-
-    for (let i = 0; i < album.length; i++) {
-      const path = `img_${i}.jpg`;
-      await client.downloadMedia(album[i].media.photo, { file: path });
-      allText += await ocrImage(path) + "\n";
-      fs.unlinkSync(path);
-    }
+  for (const p of photos) {
+    const buffer = await client.downloadMedia(p, {});
+    ocrText += await ocrBuffer(buffer);
   }
 
-  const queues = parseQueues(allText);
+  const queues = parseQueues(ocrText);
+  const date = extractDate(target.message);
+  const outText = buildMessage(date, queues, !!updatedPost);
+
   if (!Object.keys(queues).length) {
-    console.log("No queues detected");
+    console.log("[SKIP] OCR produced no queues");
     return;
   }
 
-  const date = extractDate(allText);
-  const out = buildMessage(date, queues);
+  const lastMsgId = await redisGet(REDIS_LAST_MESSAGE);
 
-  await sendToChannel(out);
-  await redisSet(LAST_KEY, String(captionMsg.id));
+  if (updatedPost && lastMsgId) {
+    console.log("[EDIT] updating existing post");
+    await editMessage(Number(lastMsgId), outText);
+  } else {
+    console.log("[POST] sending new post");
+    const newId = await sendMessage(outText);
+    await redisSet(REDIS_LAST_MESSAGE, newId);
+  }
 
-  console.log("Message sent");
+  await redisSet(
+    REDIS_LAST_ALBUM,
+    target.mediaGroupId ? String(target.mediaGroupId) : "single"
+  );
 }
 
-/* ---------------- START ---------------- */
+/* ================= START ================= */
 
 (async () => {
   await client.start();
-  console.log("Telegram client started");
-
-  await checkDTEK(); // 🔴 критично важливо
-
-  setInterval(() => {
-    console.log("Checking DTEK...");
-    checkDTEK();
-  }, 30000);
+  console.log("[START] bot started");
+  setInterval(checkDTEK, 30000);
 })();
 
 const app = express();
