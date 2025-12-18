@@ -35,8 +35,8 @@
 1️⃣ Клонування репозиторію
 
 ```bash
-git clone https://github.com/SerhiiRomanenko/dtek-schedule-monitor.git
-cd dtek-schedule-monitor
+git clone https://github.com/SerhiiRomanenko/telegram-dtek_schedule_monitor-bot.git
+cd telegram-dtek_schedule_monitor-bot
 ```
 
 2️⃣ Встановлення залежностей
