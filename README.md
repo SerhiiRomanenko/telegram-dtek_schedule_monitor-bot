@@ -37,13 +37,13 @@
 ```bash
 git clone https://github.com/SerhiiRomanenko/dtek-schedule-monitor.git
 cd dtek-schedule-monitor
+```
 
-
-### 2. Встановлення залежностей
+2️⃣ Встановлення залежностей
 ``` bash
 npm install
 ```
 
-### 3. Інші налаштування (для адміна приховані) 
+3️⃣ Інші налаштування (для адміна приховані) 
 
 Знаходяться в вихідному репо 
