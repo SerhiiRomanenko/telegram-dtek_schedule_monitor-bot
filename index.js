@@ -18,8 +18,8 @@ const {
 
 const DTEK_CHANNEL = "dtek_ua";
 
-const REDIS_LAST_ALBUM = "last_dtek_album";
 const REDIS_LAST_MESSAGE = "last_dtek_message";
+const REDIS_LAST_SOURCE = "last_dtek_source";
 
 /* ================= TELEGRAM CLIENT ================= */
 
@@ -59,17 +59,9 @@ async function sendMessage(text) {
       disable_web_page_preview: true
     })
   });
-
   const j = await r.json();
-
-  if (!j.ok) {
-    console.error("[TG ERROR]", j);
-    throw new Error("sendMessage failed");
-  }
-
   return j.result.message_id;
 }
-
 
 async function editMessage(messageId, text) {
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
@@ -89,12 +81,12 @@ async function editMessage(messageId, text) {
 
 async function ocrBuffer(buffer) {
   const { data } = await Tesseract.recognize(buffer, "ukr");
-  return data.text;
+  return data.text || "";
 }
 
 /* ================= PARSING ================= */
 
-function extractDate(text) {
+function extractDate(text = "") {
   const m = text.match(/на\s+(\d{1,2})\s+([а-яіїє]+)/i);
   return m ? `📆 ${m[1]} ${m[2]}` : "";
 }
@@ -111,7 +103,7 @@ function parseQueues(text) {
       result[current] = [];
     }
 
-    const t = l.match(/(\d{1,2}:\d{2}).+?(\d{1,2}:\d{2})/);
+    const t = l.match(/(\d{1,2}:\d{2}).*?(\d{1,2}:\d{2})/);
     if (current && t) {
       result[current].push(`❌ з ${t[1]} до ${t[2]}`);
     }
@@ -130,89 +122,84 @@ function buildMessage(date, queues, updated) {
   return msg.trim();
 }
 
-/* ================= MAIN LOGIC ================= */
+/* ================= MAIN ================= */
 
 async function checkDTEK() {
-  console.log("[CHECK] checking DTEK channel");
+  console.log("[CHECK] DTEK");
 
-  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 20 });
+  const messages = await client.getMessages(DTEK_CHANNEL, { limit: 30 });
 
-  messages.forEach(m => {
-    console.log(
-      "[MSG]",
-      m.id,
-      "photo:",
-      !!m.media?.photo,
-      "text:",
-      m.message?.slice(0, 45)
-    );
-  });
-
-  const mainPost = messages.find(m =>
-    /Київщина:.*графіки/i.test(m.message || "") &&
-    !/оновлен/i.test(m.message || "")
+  const post = messages.find(m =>
+    /Київщина:.*графік/i.test(m.message || "")
   );
 
-  const updatedPost = messages.find(m =>
-    /Київщина:.*оновлен.*графіки/i.test(m.message || "")
-  );
+  if (!post) {
+    console.log("[SKIP] no post");
+    return;
+  }
 
-  const target = updatedPost || mainPost;
+  const sourceId = post.mediaGroupId || post.id;
+  const lastSource = await redisGet(REDIS_LAST_SOURCE);
 
-  if (!target) {
-    console.log("[SKIP] no valid DTEK post");
+  if (String(sourceId) === lastSource) {
+    console.log("[SKIP] already processed");
     return;
   }
 
   let photos = [];
 
-  if (target.media?.photo) {
-    photos = [target];
+  if (post.mediaGroupId) {
+    photos = messages.filter(
+      m => m.mediaGroupId === post.mediaGroupId && m.media?.photo
+    );
+  } else if (post.media?.photo) {
+    photos = [post];
   }
 
-  if (!photos.length) {
-    console.log("[SKIP] no photos to OCR");
-    return;
-  }
+  console.log("[INFO] photos:", photos.length);
 
   let ocrText = "";
 
   for (const p of photos) {
-    const buffer = await client.downloadMedia(p, {});
+    const buffer = await client.downloadMedia(p);
     ocrText += await ocrBuffer(buffer);
   }
 
-  const queues = parseQueues(ocrText);
-  const date = extractDate(target.message);
-  const outText = buildMessage(date, queues, !!updatedPost);
+  let queues = parseQueues(ocrText);
 
   if (!Object.keys(queues).length) {
-    console.log("[SKIP] OCR produced no queues");
+    console.log("[FALLBACK] parse from text");
+    queues = parseQueues(post.message || "");
+  }
+
+  if (!Object.keys(queues).length) {
+    console.log("[SKIP] no queues");
     return;
   }
 
+  const date = extractDate(post.message);
+  const updated = /оновлен/i.test(post.message || "");
+  const outText = buildMessage(date, queues, updated);
+
   const lastMsgId = await redisGet(REDIS_LAST_MESSAGE);
 
-  if (updatedPost && lastMsgId) {
-    console.log("[EDIT] updating existing post");
+  if (updated && lastMsgId) {
+    console.log("[EDIT]");
     await editMessage(Number(lastMsgId), outText);
   } else {
-    console.log("[POST] sending new post");
-    const newId = await sendMessage(outText);
-    await redisSet(REDIS_LAST_MESSAGE, newId);
+    console.log("[POST]");
+    const id = await sendMessage(outText);
+    await redisSet(REDIS_LAST_MESSAGE, id);
   }
 
-  await redisSet(
-    REDIS_LAST_ALBUM,
-    target.mediaGroupId ? String(target.mediaGroupId) : "single"
-  );
+  await redisSet(REDIS_LAST_SOURCE, String(sourceId));
 }
 
 /* ================= START ================= */
 
 (async () => {
   await client.start();
-  console.log("[START] bot started");
+  console.log("[STARTED]");
   setInterval(checkDTEK, 30000);
 })();
 
